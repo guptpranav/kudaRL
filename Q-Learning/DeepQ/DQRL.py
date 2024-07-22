@@ -137,9 +137,108 @@ class LoadAgent():
         :param state: state
         """
         with torch.no_grad():
-            return self.model.predict(state).argmax().item()
+            return self.model.forward(state).argmax().item()
 
-class NFQ():
+class DeepQAgent():
+    """
+    :param learningRate: ALPHA
+    :type learningRate: float
+    :param discountRate: GAMMA
+    :type discountRate: float
+    :param epsMax: initial epsilon
+    :type epsMax: float
+    :param epsMin: final epsilon
+    :type epsMin: float
+    :param epsDec: episodes to linearly decay epsilon
+    :type epsDec: int
+    :param numInputs: dimension of observation space
+    :type numInputs: int
+    :param numActions: cardinality of action space
+    :type numActions: int
+    :param nodes: sizes of hidden fully connected layers
+    :type nodes: tuple
+    :param tau: fraction of policy network to supercompose onto target network
+    :type tau: float
+    :param sync: number of environment steps to sync policy and target networks
+    :type sync: int
+    :param capacity: maximum transitions to keep in replay memory
+    :type capacity: int
+    :param batchSize: size of batch of transitions to train FCQNN
+    :type batchSize: int
+    :param updates: number of update cycles per episode completed
+    :type updates: int
+    """
+    def __init__(self,
+                 learningRate:float, discountRate:float,
+                 epsMax:float, epsMin:float, epsDec:int,
+                 numInputs:int, numActions:int, nodes:tuple, tau:float, sync:int,
+                 capacity:int, batchSize:int, updates:int) -> None:
+        # hyperparameters
+        self.ALPHA      = learningRate
+        self.GAMMA      = discountRate
+        self.EPS_MAX    = epsMax
+        self.EPS_MIN    = epsMin
+        self.EPS_DEC    = epsDec
+        self.epsilon    = epsMax
+        self.numInputs  = numInputs
+        self.numActions = numActions
+        self.nodes      = nodes
+        self.sync       = sync
+        self.tau        = tau
+        self.steps2sync = 0
+
+        # instantiating replay memory
+        self.expMemory  = ReplayMemory(capacity=capacity)
+        self.batchSize  = batchSize
+        self.updates    = updates
+    
+    def step(self, state, action, reward, state_, terminated) -> None:
+        """
+        pushes transition to the top of replay memory and handles syncing of policy and target networks 
+        :param s:  start state
+        :param a:  action taken
+        :param r:  reward value
+        :param s_: next state
+        :param t:  terminal?
+        """
+        self.expMemory.store(s=state, a=action, r=reward, s_=state_, t=terminated)
+        self.steps2sync += 1
+        for target, policy in zip(self.targetNet.parameters(), self.policyNet.parameters()):
+            polyakAvg = (1-self.tau)*target.data + self.tau*policy.data
+            target.data.copy_(polyakAvg)
+        if self.steps2sync == self.sync:
+            self.steps2sync = 0
+            self.targetNet.load_state_dict(self.policyNet.state_dict())
+
+    def selectEpsilonGreedyAction(self, state) -> int:
+        """
+        selects and returns an action epsilon-greedy to action-value
+        :param state: state
+        """
+        if random.random() < self.epsilon:
+            action = random.randrange(start=0, stop=self.numActions)
+        else:
+            with torch.no_grad():
+                action = self.policyNet.forward(state).argmax().item()
+        return action
+
+    def selectGreedyAction(self, state) -> int:
+        """
+        selects and returns action greediest to action-value
+        :param state: state
+        """
+        with torch.no_grad():
+            return self.policyNet.forward(state).argmax().item()
+    
+    def save(self, PATH):
+        """
+        saves model parameters to PATH
+        :param PATH: path to save file
+        :type PATH: str
+        """
+        torch.save(self.policyNet, PATH)
+
+class NFQ(DeepQAgent):
     """
     initialises Neural Fitted Q-value RL agent: action selection and model evaluation done using the same FCQNN
     :param learningRate: ALPHA
@@ -162,30 +261,23 @@ class NFQ():
     :type capacity: int
     :param batchSize: size of batch of transitions to train FCQNN
     :type batchSize: int
+    :param updates: number of update cycles per episode completed
+    :type updates: int
     """
     def __init__(self,
                  learningRate:float, discountRate:float,
                  epsMax:float, epsMin:float, epsDec:int,
                  numInputs:int, numActions:int, nodes:tuple,
-                 capacity:int, batchSize:int) -> None:
-        # hyperparameters
-        self.ALPHA      = learningRate
-        self.GAMMA      = discountRate
-        self.EPS_MAX    = epsMax
-        self.EPS_MIN    = epsMin
-        self.EPS_DEC    = epsDec
-        self.epsilon    = epsMax
-        self.numInputs  = numInputs
-        self.numActions = numActions
+                 capacity:int, batchSize:int, updates:int) -> None:
+        super().__init__(learningRate=learningRate, discountRate=discountRate,
+                         epsMax=epsMax, epsMin=epsMin, epsDec=epsDec,
+                         numInputs=numInputs, numActions=numActions, nodes=nodes, tau=0, sync=0,
+                         capacity=capacity, batchSize=batchSize, updates=updates)
 
         # instantiating FCQNN with L2 loss and RMSProp optimiser
-        self.FCQNN      = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.loss_fn    = nn.MSELoss()
-        self.optimiser  = optim.RMSprop(self.FCQNN.parameters(), lr=self.ALPHA)
-
-        # instantiating replay memory
-        self.expMemory  = ReplayMemory(capacity=capacity)
-        self.batchSize  = batchSize
+        self.policyNet = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.loss_fn   = nn.MSELoss()
+        self.optimiser = optim.RMSprop(self.policyNet.parameters(), lr=self.ALPHA)
     
     def step(self, state, action, reward, state_, terminated) -> None:
         """
@@ -197,26 +289,85 @@ class NFQ():
         :param t:  terminal?
         """
         self.expMemory.store(s=state, a=action, r=reward, s_=state_, t=terminated)
-    
-    def selectEpsilonGreedyAction(self, state) -> int:
+
+    def update(self) -> None:
         """
-        selects and returns an epsilon-greedy action
-        :param state: state
+        trains and updates model over a batch of transitions
+        target Q values bootstrapped to 1-step TD(0) update
         """
-        if random.random() < self.epsilon:
-            action = random.randrange(start=0, stop=self.numActions)
-        else:
-            with torch.no_grad():
-                action = self.FCQNN.predict(state).argmax().item()
-        return action
-    
-    def selectGreedyAction(self, state) -> int:
-        """
-        selects and returns greediest action
-        :param state: state
-        """
-        with torch.no_grad():
-            return self.FCQNN.predict(state).argmax().item()
+        # update epsilon with linear decay
+        self.epsilon = max(self.epsilon - (self.EPS_MAX-self.EPS_MIN)/(self.EPS_DEC), self.EPS_MIN)
+
+        # skip training if minimal unique batch cannot be sampled
+        if len(self.expMemory) < self.batchSize:
+            return
+        
+        for _ in range(self.updates):
+            # sample batch
+            states, actions, rewards, states_, terminateds = self.expMemory.sampleBatch(batchSize=self.batchSize)
+            
+            # policyQ => [Q(s,a;θ)]
+            # results are kept attached to gradient chain to perform gradient ascent
+            policyQ = self.policyNet.forward(states).gather(1, actions)
+            # targetQ => [r + γ*max_{a'}Q(s',a';θ)]
+            # results are detached from the gradient chain and treated like a pseudo-constant estimate of true Q-value
+            targetQ = rewards + self.GAMMA*self.policyNet.forward(states_).detach().max(1)[0].unsqueeze(1)*(1-terminateds)
+            
+            # calculate batch loss and back-propagate
+            loss = self.loss_fn(policyQ, targetQ)
+            self.optimiser.zero_grad()
+            loss.backward()
+            self.optimiser.step()
+
+class DQN(DeepQAgent):
+    """
+    initialises Deep Q Network RL agent: action selection and model evaluation performed with seperate FCQNNs, synced periodically\n
+    learning stabilised by temporary freezing of target Q network
+    :param learningRate: ALPHA
+    :type learningRate: float
+    :param discountRate: GAMMA
+    :type discountRate: float
+    :param epsMax: initial epsilon
+    :type epsMax: float
+    :param epsMin: final epsilon
+    :type epsMin: float
+    :param epsDec: episodes to linearly decay epsilon
+    :type epsDec: int
+    :param numInputs: dimension of observation space
+    :type numInputs: int
+    :param numActions: cardinality of action space
+    :type numActions: int
+    :param nodes: sizes of hidden fully connected layers
+    :type nodes: tuple
+    :param tau: fraction of policy network to supercompose onto target network
+    :type tau: float
+    :param sync: number of environment steps to sync policy and target networks
+    :type sync: int
+    :param capacity: maximum transitions to keep in replay memory
+    :type capacity: int
+    :param batchSize: size of batch of transitions to train FCQNN
+    :type batchSize: int
+    :param updates: number of update cycles per episode completed
+    :type updates: int
+    """
+    def __init__(self,
+                 learningRate:float, discountRate:float,
+                 epsMax:float, epsMin:float, epsDec:int,
+                 numInputs:int, numActions:int, nodes:tuple, tau:int, sync:int,
+                 capacity:int, batchSize:int, updates:int) -> None:
+        super().__init__(learningRate=learningRate, discountRate=discountRate,
+                         epsMax=epsMax, epsMin=epsMin, epsDec=epsDec,
+                         numInputs=numInputs, numActions=numActions, nodes=nodes, tau=tau, sync=sync,
+                         capacity=capacity, batchSize=batchSize, updates=updates)
+        
+        # instantiating policy FCQNN with L2 loss and RMSProp optimiser
+        self.policyNet = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.loss_fn   = nn.MSELoss()
+        self.optimiser = optim.RMSprop(self.policyNet.parameters(), lr=self.ALPHA)
+
+        # instantiating target FCQNN as a copy of the policy FCQNN
+        self.targetNet = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.targetNet.load_state_dict(self.policyNet.state_dict())
     
     def update(self) -> None:
         """
@@ -234,11 +385,9 @@ class NFQ():
         states, actions, rewards, states_, terminateds = self.expMemory.sampleBatch(batchSize=self.batchSize)
         
         # policyQ => [Q(s,a;θ)]
-        # results are kept attached to gradient chain to perform gradient ascent
-        policyQ = self.FCQNN.predict(states).gather(1, actions)
-        # targetQ => [r + γ*max_{a'}Q(s',a';θ)]
-        # results are detached from the gradient chain and treated like a pseudo-constant estimate of true Q-value
-        targetQ = rewards + self.GAMMA*self.FCQNN.predict(states_).detach().max(1)[0].unsqueeze(1)*(1-terminateds)
+        policyQ = self.policyNet.forward(states).gather(1, actions)
+        # targetQ => [r + γ*max_{a'}Q(s',a';θ')]
+        targetQ = rewards + self.GAMMA*self.targetNet.forward(states_).detach().max(1)[0].unsqueeze(1)*(1-terminateds)
         
         # calculate batch loss and back-propagate
         loss = self.loss_fn(policyQ, targetQ)
@@ -246,7 +395,7 @@ class NFQ():
         loss.backward()
         self.optimiser.step()
 
-class DQN():
+class DuelingDQN(DeepQAgent):
     """
     initialises Deep Q Network RL agent: action selection and model evaluation performed with seperate FCQNNs, synced periodically\n
     learning stabilised by temporary freezing of target Q network
@@ -278,72 +427,21 @@ class DQN():
     def __init__(self,
                  learningRate:float, discountRate:float,
                  epsMax:float, epsMin:float, epsDec:int,
-                 numInputs:int, numActions:int, nodes:tuple, tau:float, sync:int,
-                 capacity:int, batchSize:int) -> None:
-        # hyperparameters
-        self.ALPHA      = learningRate
-        self.GAMMA      = discountRate
-        self.EPS_MAX    = epsMax
-        self.EPS_MIN    = epsMin
-        self.EPS_DEC    = epsDec
-        self.epsilon    = epsMax
-        self.numInputs  = numInputs
-        self.numActions = numActions
-        self.nodes      = nodes
-        self.sync       = sync
-        self.tau        = tau
-        self.steps2sync = 0
-
+                 numInputs:int, numActions:int, nodes:tuple, tau:int, sync:int,
+                 capacity:int, batchSize:int, updates:int) -> None:
+        super().__init__(learningRate=learningRate, discountRate=discountRate,
+                         epsMax=epsMax, epsMin=epsMin, epsDec=epsDec,
+                         numInputs=numInputs, numActions=numActions, nodes=nodes, tau=tau, sync=sync,
+                         capacity=capacity, batchSize=batchSize, updates=updates)
+        
         # instantiating policy FCQNN with L2 loss and RMSProp optimiser
-        self.policyFCQN = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.loss_fn    = nn.MSELoss()
-        self.optimiser  = optim.RMSprop(self.policyFCQN.parameters(), lr=self.ALPHA)
+        self.policyNet = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.loss_fn   = nn.MSELoss()
+        self.optimiser = optim.RMSprop(self.policyNet.parameters(), lr=self.ALPHA)
 
         # instantiating target FCQNN as a copy of the policy FCQNN
-        self.targetFCQN = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.targetFCQN.load_state_dict(self.policyFCQN.state_dict())
-
-        # instantiating replay memory
-        self.expMemory  = ReplayMemory(capacity=capacity)
-        self.batchSize  = batchSize
-    
-    def step(self, state, action, reward, state_, terminated) -> None:
-        """
-        pushes transition to the top of replay memory and handles syncing of policy and target networks 
-        :param s:  start state
-        :param a:  action taken
-        :param r:  reward value
-        :param s_: next state
-        :param t:  terminal?
-        """
-        self.expMemory.store(s=state, a=action, r=reward, s_=state_, t=terminated)
-        self.steps2sync += 1
-        for target, policy in zip(self.targetFCQN.parameters(), self.policyFCQN.parameters()):
-            polyakAvg = (1-self.tau)*target.data + self.tau*policy.data
-            target.data.copy_(polyakAvg)
-        if self.steps2sync == self.sync:
-            self.steps2sync = 0
-            self.targetFCQN.load_state_dict(self.policyFCQN.state_dict())
-    
-    def selectEpsilonGreedyAction(self, state) -> int:
-        """
-        selects and returns an epsilon-greedy action
-        :param state: state
-        """
-        if random.random() < self.epsilon:
-            action = random.randrange(start=0, stop=self.numActions)
-        else:
-            with torch.no_grad():
-                action = self.policyFCQN.predict(state).argmax().item()
-        return action
-    
-    def selectGreedyAction(self, state) -> int:
-        """
-        selects and returns greediest action
-        :param state: state
-        """
-        with torch.no_grad():
-            return self.policyFCQN.predict(state).argmax().item()
+        self.targetNet = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.targetNet.load_state_dict(self.policyNet.state_dict())
     
     def update(self) -> None:
         """
@@ -361,9 +459,9 @@ class DQN():
         states, actions, rewards, states_, terminateds = self.expMemory.sampleBatch(batchSize=self.batchSize)
         
         # policyQ => [Q(s,a;θ)]
-        policyQ = self.policyFCQN.predict(states).gather(1, actions)
+        policyQ = self.policyNet.forward(states).gather(1, actions)
         # targetQ => [r + γ*max_{a'}Q(s',a';θ')]
-        targetQ = rewards + self.GAMMA*self.targetFCQN.predict(states_).detach().max(1)[0].unsqueeze(1)*(1-terminateds)
+        targetQ = rewards + self.GAMMA*self.targetNet.forward(states_).detach().max(1)[0].unsqueeze(1)*(1-terminateds)
         
         # calculate batch loss and back-propagate
         loss = self.loss_fn(policyQ, targetQ)
@@ -371,132 +469,7 @@ class DQN():
         loss.backward()
         self.optimiser.step()
 
-class DuelingDQN():
-    """
-    initialises Deep Q Network RL agent: action selection and model evaluation performed with seperate FCQNNs, synced periodically\n
-    learning stabilised by temporary freezing of target Q network
-    :param learningRate: ALPHA
-    :type learningRate: float
-    :param discountRate: GAMMA
-    :type discountRate: float
-    :param epsMax: initial epsilon
-    :type epsMax: float
-    :param epsMin: final epsilon
-    :type epsMin: float
-    :param epsDec: episodes to linearly decay epsilon
-    :type epsDec: int
-    :param numInputs: dimension of observation space
-    :type numInputs: int
-    :param numActions: cardinality of action space
-    :type numActions: int
-    :param nodes: sizes of hidden fully connected layers
-    :type nodes: tuple
-    :param tau: fraction of policy network to supercompose onto target network
-    :type tau: float
-    :param sync: number of environment steps to sync policy and target networks
-    :type sync: int
-    :param capacity: maximum transitions to keep in replay memory
-    :type capacity: int
-    :param batchSize: size of batch of transitions to train FCQNN
-    :type batchSize: int
-    """
-    def __init__(self,
-                 learningRate:float, discountRate:float,
-                 epsMax:float, epsMin:float, epsDec:int,
-                 numInputs:int, numActions:int, nodes:tuple, rau:float, sync:int,
-                 capacity:int, batchSize:int) -> None:
-        # hyperparameters
-        self.ALPHA      = learningRate
-        self.GAMMA      = discountRate
-        self.EPS_MAX    = epsMax
-        self.EPS_MIN    = epsMin
-        self.EPS_DEC    = epsDec
-        self.epsilon    = epsMax
-        self.numInputs  = numInputs
-        self.numActions = numActions
-        self.nodes      = nodes
-        self.sync       = sync
-        self.tau        = tau
-        self.steps2sync = 0
-
-        # instantiating policy FCQNN with L2 loss and RMSProp optimiser
-        self.policyFCDQ = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.loss_fn    = nn.MSELoss()
-        self.optimiser  = optim.RMSprop(self.policyFCDQ.parameters(), lr=self.ALPHA)
-
-        # instantiating target FCQNN as a copy of the policy FCQNN
-        self.targetFCDQ = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.targetFCDQ.load_state_dict(self.policyFCDQ.state_dict())
-
-        # instantiating replay memory
-        self.expMemory  = ReplayMemory(capacity=capacity)
-        self.batchSize  = batchSize
-    
-    def step(self, state, action, reward, state_, terminated) -> None:
-        """
-        pushes transition to the top of replay memory and handles syncing of policy and target networks 
-        :param s:  start state
-        :param a:  action taken
-        :param r:  reward value
-        :param s_: next state
-        :param t:  terminal?
-        """
-        self.expMemory.store(s=state, a=action, r=reward, s_=state_, t=terminated)
-        self.steps2sync += 1
-        for target, policy in zip(self.targetFCDQ.parameters(), self.policyFCDQ.parameters()):
-            polyakAvg = (1-self.tau)*target.data + self.tau*policy.data
-            target.data.copy_(polyakAvg)
-        if self.steps2sync == self.sync:
-            self.steps2sync = 0
-            self.targetFCDQ.load_state_dict(self.policyFCDQ.state_dict())
-    
-    def selectEpsilonGreedyAction(self, state) -> int:
-        """
-        selects and returns an epsilon-greedy action
-        :param state: state
-        """
-        if random.random() < self.epsilon:
-            action = random.randrange(start=0, stop=self.numActions)
-        else:
-            with torch.no_grad():
-                action = self.policyFCDQ.predict(state).argmax().item()
-        return action
-    
-    def selectGreedyAction(self, state) -> int:
-        """
-        selects and returns greediest action
-        :param state: state
-        """
-        with torch.no_grad():
-            return self.policyFCDQ.predict(state).argmax().item()
-    
-    def update(self) -> None:
-        """
-        trains and updates model over a batch of transitions
-        target Q values bootstrapped to 1-step TD(0) update
-        """
-        # update epsilon with linear decay
-        self.epsilon = max(self.epsilon - (self.EPS_MAX-self.EPS_MIN)/(self.EPS_DEC), self.EPS_MIN)
-
-        # skip training if minimal unique batch cannot be sampled
-        if len(self.expMemory) < self.batchSize:
-            return
-        
-        # sample batch
-        states, actions, rewards, states_, terminateds = self.expMemory.sampleBatch(batchSize=self.batchSize)
-        
-        # policyQ => [Q(s,a;θ)]
-        policyQ = self.policyFCDQ.predict(states).gather(1, actions)
-        # targetQ => [r + γ*max_{a'}Q(s',a';θ')]
-        targetQ = rewards + self.GAMMA*self.targetFCDQ.predict(states_).detach().max(1)[0].unsqueeze(1)*(1-terminateds)
-        
-        # calculate batch loss and back-propagate
-        loss = self.loss_fn(policyQ, targetQ)
-        self.optimiser.zero_grad()
-        loss.backward()
-        self.optimiser.step()
-
-class DoubleDQN():
+class DoubleDQN(DeepQAgent):
     """
     initialises Deep Q Network RL agent: action selection and model evaluation performed with seperate FCQNNs, synced periodically\n
     stabler learning: temporary freezing of target Q network\n
@@ -529,73 +502,22 @@ class DoubleDQN():
     def __init__(self,
                  learningRate:float, discountRate:float,
                  epsMax:float, epsMin:float, epsDec:int,
-                 numInputs:int, numActions:int, nodes:tuple, tau:float, sync:int,
-                 capacity:int, batchSize:int) -> None:
-        # hyperparameters
-        self.ALPHA      = learningRate
-        self.GAMMA      = discountRate
-        self.EPS_MAX    = epsMax
-        self.EPS_MIN    = epsMin
-        self.EPS_DEC    = epsDec
-        self.epsilon    = epsMax
-        self.numInputs  = numInputs
-        self.numActions = numActions
-        self.nodes      = nodes
-        self.sync       = sync
-        self.tau        = tau
-        self.steps2sync = 0
-
+                 numInputs:int, numActions:int, nodes:tuple, tau:int, sync:int,
+                 capacity:int, batchSize:int, updates:int) -> None:
+        super().__init__(learningRate=learningRate, discountRate=discountRate,
+                         epsMax=epsMax, epsMin=epsMin, epsDec=epsDec,
+                         numInputs=numInputs, numActions=numActions, nodes=nodes, tau=tau, sync=sync,
+                         capacity=capacity, batchSize=batchSize, updates=updates)
+        
         # instantiating policy FCQNN with L2 loss and RMSProp optimiser
-        self.policyFCQN = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.loss_fn    = nn.MSELoss()
-        self.optimiser  = optim.RMSprop(self.policyFCQN.parameters(), lr=self.ALPHA)
+        self.policyNet = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.loss_fn   = nn.MSELoss()
+        self.optimiser = optim.RMSprop(self.policyNet.parameters(), lr=self.ALPHA)
 
         # instantiating target FCQNN as a copy of the policy FCQNN
-        self.targetFCQN = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.targetFCQN.load_state_dict(self.policyFCQN.state_dict())
+        self.targetNet = FCQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.targetNet.load_state_dict(self.policyNet.state_dict())
 
-        # instantiating replay memory
-        self.expMemory  = ReplayMemory(capacity=capacity)
-        self.batchSize  = batchSize
-    
-    def step(self, state, action, reward, state_, terminated) -> None:
-        """
-        pushes transition to the top of replay memory and handles syncing of policy and target networks 
-        :param s:  start state
-        :param a:  action taken
-        :param r:  reward value
-        :param s_: next state
-        :param t:  terminal?
-        """
-        self.expMemory.store(s=state, a=action, r=reward, s_=state_, t=terminated)
-        self.steps2sync += 1
-        for target, policy in zip(self.targetFCQN.parameters(), self.policyFCQN.parameters()):
-            polyakAvg = (1-self.tau)*target.data + self.tau*policy.data
-            target.data.copy_(polyakAvg)
-        if self.steps2sync == self.sync:
-            self.steps2sync = 0
-            self.targetFCQN.load_state_dict(self.policyFCQN.state_dict())
-    
-    def selectEpsilonGreedyAction(self, state) -> int:
-        """
-        selects and returns an epsilon-greedy action
-        :param state: state
-        """
-        if random.random() < self.epsilon:
-            action = random.randrange(start=0, stop=self.numActions)
-        else:
-            with torch.no_grad():
-                action = self.policyFCQN.predict(state).argmax().item()
-        return action
-    
-    def selectGreedyAction(self, state) -> int:
-        """
-        selects and returns greediest action
-        :param state: state
-        """
-        with torch.no_grad():
-            return self.policyFCQN.predict(state).argmax().item()
-    
     def update(self) -> None:
         """
         trains and updates model over a batch of transitions
@@ -612,10 +534,10 @@ class DoubleDQN():
         states, actions, rewards, states_, terminateds = self.expMemory.sampleBatch(batchSize=self.batchSize)
         
         # policyQ => [Q(s,a;θ)]
-        policyQ = self.policyFCQN.predict(states).gather(1, actions)
+        policyQ = self.policyNet.forward(states).gather(1, actions)
         # targetQ => [r + γ*Q(s',argmax_{a'}Q(s',a';θ);θ')]
-        actions_ = self.policyFCQN.predict(states_).argmax(1).unsqueeze(1) # argmax_{a'}Q(s',a';θ)
-        targetQ = rewards + self.GAMMA*self.targetFCQN.predict(states_).detach().gather(1, actions_)*(1-terminateds)
+        actions_ = self.policyNet.forward(states_).argmax(1).unsqueeze(1) # argmax_{a'}Q(s',a';θ)
+        targetQ = rewards + self.GAMMA*self.targetNet.forward(states_).detach().gather(1, actions_)*(1-terminateds)
         
         # calculate batch loss and back-propagate
         loss = self.loss_fn(policyQ, targetQ)
@@ -623,7 +545,7 @@ class DoubleDQN():
         loss.backward()
         self.optimiser.step()
 
-class DuelingDoubleDQN():
+class DuelingDoubleDQN(DeepQAgent):
     """
     initialises Deep Q Network RL agent: action selection and model evaluation performed with seperate FCQNNs, synced periodically\n
     stabler learning: temporary freezing of target Q network\n
@@ -656,72 +578,21 @@ class DuelingDoubleDQN():
     def __init__(self,
                  learningRate:float, discountRate:float,
                  epsMax:float, epsMin:float, epsDec:int,
-                 numInputs:int, numActions:int, nodes:tuple, tau:float, sync:int,
-                 capacity:int, batchSize:int) -> None:
-        # hyperparameters
-        self.ALPHA      = learningRate
-        self.GAMMA      = discountRate
-        self.EPS_MAX    = epsMax
-        self.EPS_MIN    = epsMin
-        self.EPS_DEC    = epsDec
-        self.epsilon    = epsMax
-        self.numInputs  = numInputs
-        self.numActions = numActions
-        self.nodes      = nodes
-        self.sync       = sync
-        self.tau        = tau
-        self.steps2sync = 0
-
+                 numInputs:int, numActions:int, nodes:tuple, tau:int, sync:int,
+                 capacity:int, batchSize:int, updates:int) -> None:
+        super().__init__(learningRate=learningRate, discountRate=discountRate,
+                         epsMax=epsMax, epsMin=epsMin, epsDec=epsDec,
+                         numInputs=numInputs, numActions=numActions, nodes=nodes, tau=tau, sync=sync,
+                         capacity=capacity, batchSize=batchSize, updates=updates)
+        
         # instantiating policy FCQNN with L2 loss and RMSProp optimiser
-        self.policyFCDQ = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.loss_fn    = nn.MSELoss()
-        self.optimiser  = optim.RMSprop(self.policyFCDQ.parameters(), lr=self.ALPHA)
+        self.policyNet = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.loss_fn   = nn.MSELoss()
+        self.optimiser = optim.RMSprop(self.policyNet.parameters(), lr=self.ALPHA)
 
         # instantiating target FCQNN as a copy of the policy FCQNN
-        self.targetFCDQ = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
-        self.targetFCDQ.load_state_dict(self.policyFCDQ.state_dict())
-
-        # instantiating replay memory
-        self.expMemory  = ReplayMemory(capacity=capacity)
-        self.batchSize  = batchSize
-    
-    def step(self, state, action, reward, state_, terminated) -> None:
-        """
-        pushes transition to the top of replay memory and handles syncing of policy and target networks 
-        :param s:  start state
-        :param a:  action taken
-        :param r:  reward value
-        :param s_: next state
-        :param t:  terminal?
-        """
-        self.expMemory.store(s=state, a=action, r=reward, s_=state_, t=terminated)
-        self.steps2sync += 1
-        for target, policy in zip(self.targetFCDQ.parameters(), self.policyFCDQ.parameters()):
-            polyakAvg = (1-self.tau)*target.data + self.tau*policy.data
-            target.data.copy_(polyakAvg)
-        if self.steps2sync == self.sync:
-            self.steps2sync = 0
-            self.targetFCDQ.load_state_dict(self.policyFCDQ.state_dict())
-    
-    def selectEpsilonGreedyAction(self, state) -> int:
-        """
-        selects and returns an epsilon-greedy action
-        :param state: state
-        """
-        if random.random() < self.epsilon:
-            action = random.randrange(start=0, stop=self.numActions)
-        else:
-            with torch.no_grad():
-                action = self.policyFCDQ.predict(state).argmax().item()
-        return action
-    
-    def selectGreedyAction(self, state) -> int:
-        """
-        selects and returns greediest action
-        :param state: state
-        """
-        with torch.no_grad():
-            return self.policyFCDQ.predict(state).argmax().item()
+        self.targetNet = FCDuelingQNet(numInputs=numInputs, numActions=numActions, nodes=nodes)
+        self.targetNet.load_state_dict(self.policyNet.state_dict())
     
     def update(self) -> None:
         """
@@ -739,10 +610,10 @@ class DuelingDoubleDQN():
         states, actions, rewards, states_, terminateds = self.expMemory.sampleBatch(batchSize=self.batchSize)
         
         # policyQ => [Q(s,a;θ)]
-        policyQ = self.policyFCDQ.predict(states).gather(1, actions)
+        policyQ = self.policyNet.forward(states).gather(1, actions)
         # targetQ => [r + γ*Q(s',argmax_{a'}Q(s',a';θ);θ')]
-        actions_ = self.policyFCDQ.predict(states_).argmax(1).unsqueeze(1) # argmax_{a'}Q(s',a';θ)
-        targetQ = rewards + self.GAMMA*self.targetFCDQ.predict(states_).detach().gather(1, actions_)*(1-terminateds)
+        actions_ = self.policyNet.forward(states_).argmax(1).unsqueeze(1) # argmax_{a'}Q(s',a';θ)
+        targetQ = rewards + self.GAMMA*self.targetNet.forward(states_).detach().gather(1, actions_)*(1-terminateds)
         
         # calculate batch loss and back-propagate
         loss = self.loss_fn(policyQ, targetQ)
