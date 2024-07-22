@@ -2,7 +2,6 @@ import torch
 from torch import nn, optim
 
 import random
-import gymnasium as gym
 from collections import deque
 
 # enable GPU acceleration if available
@@ -53,6 +52,8 @@ class ReplayMemory():
         batchS_ = torch.FloatTensor([self.bufferS_[idx] for idx in indices]).to(DEVICE)
         batchT  = torch.IntTensor  ([self.bufferT[idx]  for idx in indices]).to(DEVICE).view(-1, 1)
         return batchS, batchA, batchR, batchS_, batchT
+
+# TODO: implement Prioritized Experience Replay (paper/grokking)
 
 class FCQNet(nn.Module):
     """
@@ -128,7 +129,7 @@ class LoadAgent():
     :param modelPATH: path to model file
     :type modelPATH: string
     """
-    def __init__(self, PATH):
+    def __init__(self, PATH) -> None:
         self.model = torch.load(PATH)
     
     def selectAction(self, state) -> int:
@@ -230,7 +231,7 @@ class DeepQAgent():
         with torch.no_grad():
             return self.policyNet.forward(state).argmax().item()
     
-    def save(self, PATH):
+    def save(self, PATH) -> None:
         """
         saves model parameters to PATH
         :param PATH: path to save file
